@@ -45,6 +45,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/iterator.h"
 #include "llvm/ADT/iterator_range.h"
+#include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
@@ -57,6 +58,7 @@
 #include <iterator>
 #include <string>
 #include <utility>
+#include <iostream>
 
 namespace llvm {
 
@@ -136,7 +138,7 @@ public:
     enum Kind : bool { Ref = false, Call = true };
 
     Edge();
-    explicit Edge(Node &N, Kind K);
+    explicit Edge(Node &N, Kind K, Optional<uint64_t> P = None);
 
     /// Test whether the edge is null.
     ///
@@ -146,6 +148,9 @@ public:
 
     /// Returnss the \c Kind of the edge.
     Kind getKind() const;
+
+    /// Return the Call Profile Count
+    Optional<uint64_t> getProfileCount() const;
 
     /// Test whether the edge represents a direct call to a function.
     ///
@@ -167,6 +172,8 @@ public:
     friend class LazyCallGraph::RefSCC;
 
     PointerIntPair<Node *, 1, Kind> Value;
+
+    Optional<uint64_t> ProfileCount;
 
     void setKind(Kind K) { Value.setInt(K); }
   };
@@ -918,7 +925,8 @@ public:
   /// No function definitions are scanned until their nodes in the graph are
   /// requested during traversal.
   LazyCallGraph(Module &M,
-                function_ref<TargetLibraryInfo &(Function &)> GetTLI);
+                function_ref<TargetLibraryInfo &(Function &)> GetTLI,
+                std::function<BlockFrequencyInfo &(Function &)> GetBFI = nullptr);
 
   LazyCallGraph(LazyCallGraph &&G);
   LazyCallGraph &operator=(LazyCallGraph &&RHS);
@@ -928,8 +936,12 @@ public:
 
   EdgeSequence::iterator begin() { return EntryEdges.begin(); }
   EdgeSequence::iterator end() { return EntryEdges.end(); }
+  
+  bool hasGetBFI() { return !!GetBFI; }
 
   void buildRefSCCs();
+
+  void buildSubGraphs(int64_t SubGraphSize = 5);
 
   postorder_ref_scc_iterator postorder_ref_scc_begin() {
     if (!EntryEdges.empty())
@@ -947,6 +959,11 @@ public:
 
   iterator_range<postorder_ref_scc_iterator> postorder_ref_sccs() {
     return make_range(postorder_ref_scc_begin(), postorder_ref_scc_end());
+  }
+
+  iterator_range<pointee_iterator<SmallVectorImpl<RefSCC *>::const_iterator> > 
+  sub_graph_ccs() {
+    return make_range(SubGraphRefCCs.begin(), SubGraphRefCCs.end());
   }
 
   /// Lookup a function in the graph which has already been scanned and added.
@@ -1179,6 +1196,13 @@ private:
   /// Helper to update pointers back to the graph object during moves.
   void updateGraphPtrs();
 
+  /// Getter for BlockFrequencyInfo
+  std::function<BlockFrequencyInfo &(Function &)> GetBFI;
+  
+  /// The sub graph Ref CCs.
+  // SmallVector<SCC *, 16> SubGraphCCs;
+  SmallVector<RefSCC *, 16> SubGraphRefCCs;
+
   /// Allocates an SCC and constructs it using the graph allocator.
   ///
   /// The arguments are forwarded to the constructor.
@@ -1227,7 +1251,7 @@ private:
 };
 
 inline LazyCallGraph::Edge::Edge() : Value() {}
-inline LazyCallGraph::Edge::Edge(Node &N, Kind K) : Value(&N, K) {}
+inline LazyCallGraph::Edge::Edge(Node &N, Kind K, Optional<uint64_t> P) : Value(&N, K), ProfileCount(P) {}
 
 inline LazyCallGraph::Edge::operator bool() const {
   return Value.getPointer() && !Value.getPointer()->isDead();
@@ -1236,6 +1260,11 @@ inline LazyCallGraph::Edge::operator bool() const {
 inline LazyCallGraph::Edge::Kind LazyCallGraph::Edge::getKind() const {
   assert(*this && "Queried a null edge!");
   return Value.getInt();
+}
+
+inline Optional<uint64_t> LazyCallGraph::Edge::getProfileCount() const {
+  assert(*this && "Queried a null edge!");
+  return ProfileCount;
 }
 
 inline bool LazyCallGraph::Edge::isCall() const {
@@ -1288,10 +1317,13 @@ public:
   LazyCallGraph run(Module &M, ModuleAnalysisManager &AM) {
     FunctionAnalysisManager &FAM =
         AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+    auto GetBFI = [&FAM](Function &F) -> BlockFrequencyInfo & {
+      return FAM.getResult<BlockFrequencyAnalysis>(F);
+    };
     auto GetTLI = [&FAM](Function &F) -> TargetLibraryInfo & {
       return FAM.getResult<TargetLibraryAnalysis>(F);
     };
-    return LazyCallGraph(M, GetTLI);
+    return LazyCallGraph(M, GetTLI, GetBFI);
   }
 };
 

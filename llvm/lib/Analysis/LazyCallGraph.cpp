@@ -8,6 +8,7 @@
 
 #include "llvm/Analysis/LazyCallGraph.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/Sequence.h"
@@ -32,6 +33,7 @@
 #include <cassert>
 #include <cstddef>
 #include <iterator>
+#include <queue>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -62,12 +64,13 @@ bool LazyCallGraph::EdgeSequence::removeEdgeInternal(Node &TargetN) {
 
 static void addEdge(SmallVectorImpl<LazyCallGraph::Edge> &Edges,
                     DenseMap<LazyCallGraph::Node *, int> &EdgeIndexMap,
-                    LazyCallGraph::Node &N, LazyCallGraph::Edge::Kind EK) {
+                    LazyCallGraph::Node &N, LazyCallGraph::Edge::Kind EK,
+                    Optional<uint64_t> Count = None) {
   if (!EdgeIndexMap.insert({&N, Edges.size()}).second)
     return;
 
   LLVM_DEBUG(dbgs() << "    Added callable function: " << N.getName() << "\n");
-  Edges.emplace_back(LazyCallGraph::Edge(N, EK));
+  Edges.emplace_back(LazyCallGraph::Edge(N, EK, Count));
 }
 
 LazyCallGraph::EdgeSequence &LazyCallGraph::Node::populateSlow() {
@@ -81,6 +84,12 @@ LazyCallGraph::EdgeSequence &LazyCallGraph::Node::populateSlow() {
   SmallVector<Constant *, 16> Worklist;
   SmallPtrSet<Function *, 4> Callees;
   SmallPtrSet<Constant *, 16> Visited;
+
+  assert(G->GetBFI && "GetBFI must be available");
+  BlockFrequencyInfo *BFI = F->isDeclaration() ? nullptr : &(G->GetBFI(*F));
+  // assert(BFI && "BFI must be available");
+
+  LLVM_DEBUG(dbgs() << "  Got GetBFI in " << getName() << "\n");
 
   // Find all the potential call graph edges in this function. We track both
   // actual call edges and indirect references to functions. The direct calls
@@ -105,8 +114,9 @@ LazyCallGraph::EdgeSequence &LazyCallGraph::Node::populateSlow() {
           if (!Callee->isDeclaration())
             if (Callees.insert(Callee).second) {
               Visited.insert(Callee);
+              auto ProfileCount = BFI ? BFI->getBlockProfileCount(CB->getParent()) : None;
               addEdge(Edges->Edges, Edges->EdgeIndexMap, G->get(*Callee),
-                      LazyCallGraph::Edge::Call);
+                      LazyCallGraph::Edge::Call, ProfileCount);
             }
 
       for (Value *Op : I.operand_values())
@@ -155,7 +165,10 @@ static bool isKnownLibFunction(Function &F, TargetLibraryInfo &TLI) {
 }
 
 LazyCallGraph::LazyCallGraph(
-    Module &M, function_ref<TargetLibraryInfo &(Function &)> GetTLI) {
+    Module &M, 
+    function_ref<TargetLibraryInfo &(Function &)> GetTLI,
+    std::function<BlockFrequencyInfo &(Function &)> GetBFI)
+    : GetBFI(GetBFI) {
   LLVM_DEBUG(dbgs() << "Building CG for module: " << M.getModuleIdentifier()
                     << "\n");
   for (Function &F : M) {
@@ -210,8 +223,11 @@ LazyCallGraph::LazyCallGraph(
 LazyCallGraph::LazyCallGraph(LazyCallGraph &&G)
     : BPA(std::move(G.BPA)), NodeMap(std::move(G.NodeMap)),
       EntryEdges(std::move(G.EntryEdges)), SCCBPA(std::move(G.SCCBPA)),
-      SCCMap(std::move(G.SCCMap)),
-      LibFunctions(std::move(G.LibFunctions)) {
+      SCCMap(std::move(G.SCCMap)), 
+      LibFunctions(std::move(G.LibFunctions)),
+      GetBFI(std::move(G.GetBFI)) {
+  LLVM_DEBUG(
+      dbgs() << "Move Constructors, hasGetBFI: " << hasGetBFI() << "\n");
   updateGraphPtrs();
 }
 
@@ -231,6 +247,7 @@ LazyCallGraph &LazyCallGraph::operator=(LazyCallGraph &&G) {
   SCCBPA = std::move(G.SCCBPA);
   SCCMap = std::move(G.SCCMap);
   LibFunctions = std::move(G.LibFunctions);
+  GetBFI = std::move(G.GetBFI);
   updateGraphPtrs();
   return *this;
 }
@@ -1962,15 +1979,102 @@ void LazyCallGraph::buildRefSCCs() {
       });
 }
 
+void LazyCallGraph::buildSubGraphs(int64_t SubGraphSize) {
+  if (EntryEdges.empty())
+    // Sub graph are either non-existent or already built!
+    return;
+
+  SmallVector<Node *, 16> Worklist;
+  std::queue<Node *> Queue;
+  SmallVector<std::pair<Node *, Edge *>, 16> CallEdges;
+  SmallPtrSet<Node *, 16> Visited;
+
+  // collect all edges
+  for (Edge &E : *this)
+    Queue.push(&E.getNode());
+
+  while (!Queue.empty()) {
+    Node *N = Queue.front();
+    Queue.pop();
+
+    if (!Visited.insert(N).second || N->getFunction().isDeclaration())
+      continue;
+
+    N->populate();
+    for (auto I = (*N)->call_begin(), E =(*N)->call_end(); I != E; I++) {
+      Node Callee = I->getNode();
+      auto &CallEdge = *I;
+      CallEdges.push_back({N, &CallEdge});
+      if (!Visited.count(&Callee)) 
+        Queue.push(&Callee);
+    }
+  }
+
+
+  // sort edges with call frequency
+  std::sort(CallEdges.begin(), CallEdges.end(), \
+      [](const std::pair<Node *, Edge *> &p1, const std::pair<Node *, Edge *> &p2) {
+        Node *N1, *N2;
+        Edge *E1, *E2;
+        std::tie(N1, E1) = p1;
+        std::tie(N2, E2) = p2;
+        
+        auto EntryCount1 = N1->getFunction().getEntryCount().getCount();
+        auto EntryCount2 = N2->getFunction().getEntryCount().getCount();
+        auto CalledCount1 = E1->getProfileCount().getValueOr(0);
+        auto CalledCount2 = E2->getProfileCount().getValueOr(0);
+        return CalledCount1 * EntryCount2 > CalledCount2 * EntryCount1;
+      });
+
+  // form subgraph CC
+  EquivalenceClasses<Node *> EC;
+  for (const auto &p : CallEdges) {
+    Node *N;
+    Edge *E;
+    std::tie(N, E) = p;
+    Node *CalledN = &(E->getNode());
+
+    auto Leader1 = EC.getOrInsertLeaderValue(N);
+    auto Leader2 = EC.getOrInsertLeaderValue(CalledN);
+    auto GetSize = [&](Node *N) -> int64_t {
+      auto MI = EC.findLeader(N);
+      // return EC.member_end() - EC.member_begin(I);
+      // return EC.member_end() - MI;
+      int64_t count = 0;
+      for (auto ME = EC.member_end(); MI != ME; ++MI) {
+        ++count;
+      }
+      return count;
+    };
+
+    if (Leader1 != Leader2 && GetSize(Leader1) + GetSize(Leader2) <= SubGraphSize) {
+      EC.unionSets(Leader1, Leader2);
+    }
+  }
+
+  for (auto I = EC.begin(), E = EC.end(); I != E; ++I) {
+    if (!I->isLeader()) continue;
+    // auto CCNodes = make_range(EC.member_begin(I), EC.member_end());
+    // SubGraphCCs.push_back(createSCC(nullptr, CCNodes));
+
+    auto Nodes = make_range(EC.member_begin(I), EC.member_end());
+    RefSCC *NewRC = createRefSCC(*this);
+    (*NewRC).SCCs.push_back(createSCC(*NewRC, Nodes));
+    SubGraphRefCCs.push_back(NewRC);
+  }
+}
+
 AnalysisKey LazyCallGraphAnalysis::Key;
 
 LazyCallGraphPrinterPass::LazyCallGraphPrinterPass(raw_ostream &OS) : OS(OS) {}
 
 static void printNode(raw_ostream &OS, LazyCallGraph::Node &N) {
   OS << "  Edges in function: " << N.getFunction().getName() << "\n";
+  OS << "    Function Entry Profile Count: " << N.getFunction().getEntryCount().getCount() << "\n";
   for (LazyCallGraph::Edge &E : N.populate())
     OS << "    " << (E.isCall() ? "call" : "ref ") << " -> "
-       << E.getFunction().getName() << "\n";
+       << E.getFunction().getName() << "\n"
+       << "    Profile count: " << E.getProfileCount() << "\n";
 
   OS << "\n";
 }
@@ -1994,6 +2098,7 @@ static void printRefSCC(raw_ostream &OS, LazyCallGraph::RefSCC &C) {
 PreservedAnalyses LazyCallGraphPrinterPass::run(Module &M,
                                                 ModuleAnalysisManager &AM) {
   LazyCallGraph &G = AM.getResult<LazyCallGraphAnalysis>(M);
+  assert(G.hasGetBFI());
 
   OS << "Printing the call graph for module: " << M.getModuleIdentifier()
      << "\n\n";
@@ -2003,6 +2108,11 @@ PreservedAnalyses LazyCallGraphPrinterPass::run(Module &M,
 
   G.buildRefSCCs();
   for (LazyCallGraph::RefSCC &C : G.postorder_ref_sccs())
+    printRefSCC(OS, C);
+
+  OS << "Printing the subgraph for the call graph " << "\n\n";
+  G.buildSubGraphs();
+  for (LazyCallGraph::RefSCC &C : G.sub_graph_ccs())
     printRefSCC(OS, C);
 
   return PreservedAnalyses::all();
