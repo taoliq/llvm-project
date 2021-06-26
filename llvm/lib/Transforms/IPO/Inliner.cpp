@@ -724,22 +724,11 @@ private:
   size_t FirstIndex = 0;
 };
 
+template <typename Priority>
 class PriorityInlineOrder : public InlineOrder<std::pair<CallBase *, int>> {
-  using T = std::pair<CallBase *, int>;
+  using T = std::pair<CallBase *, Priority>;
   using reference = T &;
   using const_reference = const T &;
-
-  // Return true if S1 is more desirable than S2.
-  static bool isMoreDesirable(int S1, int S2) { return S1 < S2; }
-
-  static bool cmp(const T &P1, const T &P2) {
-    return isMoreDesirable(P2.second, P1.second);
-  }
-
-  int evaluate(CallBase *CB) {
-    Function *Callee = CB->getCalledFunction();
-    return (int)Callee->getInstructionCount();
-  }
 
   // A call site could become less desirable for inlining because of the size
   // growth from prior inlining into the callee. This method is used to lazily
@@ -753,8 +742,8 @@ class PriorityInlineOrder : public InlineOrder<std::pair<CallBase *, int>> {
     do {
       CallBase *CB = Heap.front().first;
       const int PreviousGoodness = Heap.front().second;
-      const int CurrentGoodness = evaluate(CB);
-      Changed = isMoreDesirable(PreviousGoodness, CurrentGoodness);
+      const int CurrentGoodness = Evaluate(CB);
+      Changed = IsMoreDesirable(PreviousGoodness, CurrentGoodness);
       if (Changed) {
         std::pop_heap(Heap.begin(), Heap.end(), cmp);
         Heap.pop_back();
@@ -765,12 +754,20 @@ class PriorityInlineOrder : public InlineOrder<std::pair<CallBase *, int>> {
   }
 
 public:
+  PriorityInlineOrder(std::function<bool(Priority, Priority)> IsMoreDesirable,
+                      std::function<Priority(CallBase *)> Evaluate)
+      : IsMoreDesirable(IsMoreDesirable), Evaluate(Evaluate) {
+    cmp = [=](const T &P1, const T &P2) -> bool {
+      return IsMoreDesirable(P2.second, P1.second);
+    };
+  }
+
   size_t size() override { return Heap.size(); }
 
   void push(const T &Elt) override {
     CallBase *CB = Elt.first;
     const int InlineHistoryID = Elt.second;
-    const int Goodness = evaluate(CB);
+    const int Goodness = Evaluate(CB);
 
     Heap.push_back({CB, Goodness});
     std::push_heap(Heap.begin(), Heap.end(), cmp);
@@ -805,6 +802,9 @@ public:
 private:
   SmallVector<T, 16> Heap;
   DenseMap<CallBase *, int> InlineHistoryMap;
+  std::function<bool(const T &, const T &)> cmp;
+  std::function<bool(Priority, Priority)> IsMoreDesirable;
+  std::function<Priority(CallBase *)> Evaluate;
 };
 
 PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
@@ -853,9 +853,16 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
   // and eventually they all become too large to inline, rather than
   // incrementally maknig a single function grow in a super linear fashion.
   std::unique_ptr<InlineOrder<std::pair<CallBase *, int>>> Calls;
-  if (InlineEnablePriorityOrder)
-    Calls = std::make_unique<PriorityInlineOrder>();
-  else
+  if (InlineEnablePriorityOrder) {
+    auto IsMoreDesirable = [](int S1, int S2) { return S1 < S2; };
+    auto Evaluate = [](CallBase *CB) {
+      Function *Callee = CB->getCalledFunction();
+      return (int)Callee->getInstructionCount();
+    };
+
+    Calls =
+        std::make_unique<PriorityInlineOrder<int>>(IsMoreDesirable, Evaluate);
+  } else
     Calls = std::make_unique<DefaultInlineOrder<std::pair<CallBase *, int>>>();
   assert(Calls != nullptr && "Expected an initialized InlineOrder");
 
