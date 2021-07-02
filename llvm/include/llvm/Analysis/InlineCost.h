@@ -270,6 +270,16 @@ Optional<int> getInliningCostEstimate(
     ProfileSummaryInfo *PSI = nullptr,
     OptimizationRemarkEmitter *ORE = nullptr);
 
+Optional<std::pair<APInt, APInt>> getInlineCostBenefitPair(
+    CallBase &Call, const InlineParams &Params, TargetTransformInfo &CalleeTTI,
+    function_ref<AssumptionCache &(Function &)> GetAssumptionCache,
+    function_ref<BlockFrequencyInfo &(Function &)> GetBFI,
+    ProfileSummaryInfo *PSI, OptimizationRemarkEmitter *ORE);
+
+Optional<std::pair<APInt, APInt>>
+getInlineCostBenefitPair(CallBase &CB, FunctionAnalysisManager &FAM,
+                         const InlineParams &Params);
+
 /// Minimal filter to detect invalid constructs for inlining.
 InlineResult isInlineViable(Function &Callee);
 
