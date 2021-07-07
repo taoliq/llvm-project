@@ -492,7 +492,7 @@ class InlineCostCallAnalyzer final : public CallAnalyzer {
   bool DecidedByCostBenefit = false;
 
   // The cost-benefit pair computed by cost-benefit analysis.
-  std::pair<APInt, APInt> CostBenefitPair;
+  std::unique_ptr<CostBenefitPair> CostBenefit = nullptr;
 
   bool SingleBB = true;
 
@@ -791,7 +791,7 @@ class InlineCostCallAnalyzer final : public CallAnalyzer {
     // savings threshold.
     Size = Size > InlineSizeAllowance ? Size - InlineSizeAllowance : 1;
 
-    CostBenefitPair = std::make_pair(APInt(128, Size), CycleSavings);
+    CostBenefit = std::make_unique<CostBenefitPair>(APInt(128, Size), APInt(CycleSavings));
 
     // Return true if the savings justify the cost of inlining.  Specifically,
     // we evaluate the following inequality:
@@ -940,7 +940,7 @@ public:
   virtual ~InlineCostCallAnalyzer() {}
   int getThreshold() { return Threshold; }
   int getCost() { return Cost; }
-  std::pair<APInt, APInt> getCostBenefitPair() { return CostBenefitPair; }
+  CostBenefitPair getCostBenefitPair() { return *CostBenefit; }
   bool wasDecidedByCostBenefit() { return DecidedByCostBenefit; }
 };
 } // namespace
@@ -2511,47 +2511,6 @@ Optional<int> llvm::getInliningCostEstimate(
   return CA.getCost();
 }
 
-Optional<std::pair<APInt, APInt>> llvm::getInlineCostBenefitPair(
-    CallBase &Call, const InlineParams &Params, TargetTransformInfo &CalleeTTI,
-    function_ref<AssumptionCache &(Function &)> GetAssumptionCache,
-    function_ref<BlockFrequencyInfo &(Function &)> GetBFI,
-    ProfileSummaryInfo *PSI, OptimizationRemarkEmitter *ORE) {
-
-  InlineCostCallAnalyzer CA(*Call.getCalledFunction(), Call, Params, CalleeTTI,
-                            GetAssumptionCache, GetBFI, PSI, ORE, true,
-                            /*IgnoreThreshold*/ true);
-  auto R = CA.analyze();
-  if (!R.isSuccess())
-    return None;
-  return CA.getCostBenefitPair();
-}
-
-Optional<std::pair<APInt, APInt>>
-llvm::getInlineCostBenefitPair(CallBase &CB, FunctionAnalysisManager &FAM,
-                               const InlineParams &Params) {
-  Function &Caller = *CB.getCaller();
-  ProfileSummaryInfo *PSI =
-      FAM.getResult<ModuleAnalysisManagerFunctionProxy>(Caller)
-          .getCachedResult<ProfileSummaryAnalysis>(
-              *CB.getParent()->getParent()->getParent());
-
-  auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(Caller);
-  auto GetAssumptionCache = [&](Function &F) -> AssumptionCache & {
-    return FAM.getResult<AssumptionAnalysis>(F);
-  };
-  auto GetBFI = [&](Function &F) -> BlockFrequencyInfo & {
-    return FAM.getResult<BlockFrequencyAnalysis>(F);
-  };
-
-  Function &Callee = *CB.getCalledFunction();
-  auto &CalleeTTI = FAM.getResult<TargetIRAnalysis>(Callee);
-  bool RemarksEnabled =
-      Callee.getContext().getDiagHandlerPtr()->isMissedOptRemarkEnabled(
-          DEBUG_TYPE);
-  return getInlineCostBenefitPair(CB, Params, CalleeTTI, GetAssumptionCache,
-                                  GetBFI, PSI, RemarksEnabled ? &ORE : nullptr);
-}
-
 Optional<InlineResult> llvm::getAttributeBasedInliningDecision(
     CallBase &Call, Function *Callee, TargetTransformInfo &CalleeTTI,
     function_ref<const TargetLibraryInfo &(Function &)> GetTLI) {
@@ -2661,9 +2620,9 @@ InlineCost llvm::getInlineCost(
   // as it's not what drives cost-benefit analysis.
   if (CA.wasDecidedByCostBenefit()) {
     if (ShouldInline.isSuccess())
-      return InlineCost::getAlways("benefit over cost");
+      return InlineCost::getAlways("benefit over cost", CA.getCostBenefitPair());
     else
-      return InlineCost::getNever("cost over benefit");
+      return InlineCost::getNever("cost over benefit", CA.getCostBenefitPair());
   }
 
   // Check if there was a reason to force inlining or no inlining.
