@@ -12,13 +12,19 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/InlineCost.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/Instructions.h"
 #include <algorithm>
 #include <utility>
 
 namespace llvm {
 class CallBase;
 class Function;
+
+enum class InlinePriorityMode : int { NoPriority, Size, Cost, OptRatio };
 
 template <typename T> class InlineOrder {
 public:
@@ -87,6 +93,36 @@ public:
   int Size;
 };
 
+class InlineCostPriority {
+public:
+  InlineCostPriority(int Cost) : Cost(Cost) {}
+
+  static bool isMoreDesirable(const InlineCostPriority &S1,
+                              const InlineCostPriority &S2) {
+    return S1.Cost < S2.Cost;
+  }
+
+  int Cost;
+};
+
+class CostBenefitPriority {
+public:
+  CostBenefitPriority(APInt Cost, APInt Benefit)
+      : Cost(Cost), Benefit(Benefit) {}
+  CostBenefitPriority(CostBenefitPair CBP)
+      : Cost(CBP.getCost()), Benefit(CBP.getBenefit()) {}
+
+  static bool isMoreDesirable(const CostBenefitPriority &S1,
+                              const CostBenefitPriority &S2) {
+    APInt LHS = S1.Benefit * S2.Cost;
+    APInt RHS = S2.Benefit * S1.Cost;
+    return LHS.uge(RHS);
+  }
+
+  APInt Cost;
+  APInt Benefit;
+};
+
 template <typename PriorityT>
 class PriorityInlineOrder : public InlineOrder<std::pair<CallBase *, int>> {
   using T = std::pair<CallBase *, int>;
@@ -110,7 +146,7 @@ class PriorityInlineOrder : public InlineOrder<std::pair<CallBase *, int>> {
     do {
       CallBase *CB = Heap.front().first;
       const PriorityT PreviousGoodness = Heap.front().second;
-      const PriorityT CurrentGoodness = PriorityT::evaluate(CB);
+      const PriorityT CurrentGoodness = evaluate(CB);
       Changed = PriorityT::isMoreDesirable(PreviousGoodness, CurrentGoodness);
       if (Changed) {
         std::pop_heap(Heap.begin(), Heap.end(), cmp);
@@ -122,12 +158,16 @@ class PriorityInlineOrder : public InlineOrder<std::pair<CallBase *, int>> {
   }
 
 public:
+  PriorityInlineOrder() : evaluate(PriorityT::evaluate){};
+  PriorityInlineOrder(std::function<PriorityT(CallBase *)> evaluate)
+      : evaluate(evaluate){};
+
   size_t size() override { return Heap.size(); }
 
   void push(const T &Elt) override {
     CallBase *CB = Elt.first;
     const int InlineHistoryID = Elt.second;
-    const PriorityT Goodness = PriorityT::evaluate(CB);
+    const PriorityT Goodness = evaluate(CB);
 
     Heap.push_back({CB, Goodness});
     std::push_heap(Heap.begin(), Heap.end(), cmp);
@@ -165,6 +205,11 @@ public:
 private:
   SmallVector<HeapT, 16> Heap;
   DenseMap<CallBase *, int> InlineHistoryMap;
+  std::function<PriorityT(CallBase *)> evaluate;
 };
+
+std::unique_ptr<InlineOrder<std::pair<CallBase *, int>>>
+getInlineOrder(InlinePriorityMode UseInlinePriority,
+               FunctionAnalysisManager &FAM, const InlineParams &Params);
 } // namespace llvm
 #endif // LLVM_ANALYSIS_INLINEORDER_H
