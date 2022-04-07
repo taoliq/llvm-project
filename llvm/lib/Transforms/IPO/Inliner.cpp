@@ -782,9 +782,12 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
   // and eventually they all become too large to inline, rather than
   // incrementally maknig a single function grow in a super linear fashion.
   std::unique_ptr<InlineOrder<std::pair<CallBase *, int>>> Calls;
+  /*
   if (InlineEnablePriorityOrder)
-    Calls = std::make_unique<PriorityInlineOrder<InlineSizePriority>>();
+    // Calls = std::make_unique<PriorityInlineOrder<InlineSizePriority>>();
+    Calls = std::make_unique<DefaultInlineOrder<std::pair<CallBase *, int>>>();
   else
+  */
     Calls = std::make_unique<DefaultInlineOrder<std::pair<CallBase *, int>>>();
   assert(Calls != nullptr && "Expected an initialized InlineOrder");
 

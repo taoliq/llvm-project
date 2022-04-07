@@ -70,33 +70,52 @@ private:
   size_t FirstIndex = 0;
 };
 
-class InlineSizePriority {
+class InlinePriority {
 public:
-  InlineSizePriority(int Size) : Size(Size) {}
-
-  static bool isMoreDesirable(const InlineSizePriority &S1,
-                              const InlineSizePriority &S2) {
-    return S1.Size < S2.Size;
-  }
-
-  static InlineSizePriority evaluate(CallBase *CB) {
-    Function *Callee = CB->getCalledFunction();
-    return InlineSizePriority(Callee->getInstructionCount());
-  }
-
-  int Size;
+  virtual bool compare(const CallBase *L, const CallBase *R) = 0;  
+  virtual void update(const CallBase *CB) = 0;
+  virtual bool hasDecreasedPriority(const CallBase *CB) = 0;
 };
 
-template <typename PriorityT>
+class SizePriority : public InlinePriority {
+  using PriorityT = unsigned;
+  DenseMap<const CallBase *, PriorityT> Priorities;
+
+  static PriorityT evaluate(const CallBase *CB) {
+    Function *Callee = CB->getCalledFunction();
+    return Callee->getInstructionCount();
+  }
+
+  static bool isMoreDesirable(const PriorityT &P1,
+                              const PriorityT &P2) {
+    return P1 < P2;
+  }
+
+  // Return true if L has higher priority than R.
+  bool compare(const CallBase *L, const CallBase *R) override {
+    const auto I1 = Priorities.find(L);
+    const auto I2 = Priorities.find(R);
+    assert(I1 != Priorities.end() && I2 != Priorities.end());
+    return isMoreDesirable((*I1).second, (*I2).second);
+  }
+
+public:
+
+  // Update the priority associated with CB.
+  void update(const CallBase *CB) override {
+    Priorities[CB] = evaluate(CB);
+  };
+
+  bool hasDecreasedPriority(const CallBase *CB) override {
+      const auto CurrentPriority = evaluate(CB);
+      return isMoreDesirable(Priorities[CB], CurrentPriority);
+  }
+};
+
 class PriorityInlineOrder : public InlineOrder<std::pair<CallBase *, int>> {
   using T = std::pair<CallBase *, int>;
-  using HeapT = std::pair<CallBase *, PriorityT>;
   using reference = T &;
   using const_reference = const T &;
-
-  static bool cmp(const HeapT &P1, const HeapT &P2) {
-    return PriorityT::isMoreDesirable(P2.second, P1.second);
-  }
 
   // A call site could become less desirable for inlining because of the size
   // growth from prior inlining into the callee. This method is used to lazily
@@ -108,28 +127,31 @@ class PriorityInlineOrder : public InlineOrder<std::pair<CallBase *, int>> {
   void adjust() {
     bool Changed = false;
     do {
-      CallBase *CB = Heap.front().first;
-      const PriorityT PreviousGoodness = Heap.front().second;
-      const PriorityT CurrentGoodness = PriorityT::evaluate(CB);
-      Changed = PriorityT::isMoreDesirable(PreviousGoodness, CurrentGoodness);
+      const CallBase *CB = Heap.front();
+      Changed = PriorityPtr->hasDecreasedPriority(CB);
       if (Changed) {
         std::pop_heap(Heap.begin(), Heap.end(), cmp);
-        Heap.pop_back();
-        Heap.push_back({CB, CurrentGoodness});
+        PriorityPtr->update(CB);
         std::push_heap(Heap.begin(), Heap.end(), cmp);
       }
     } while (Changed);
   }
 
 public:
+  PriorityInlineOrder(std::unique_ptr<InlinePriority> PriorityPtr) : PriorityPtr(std::move(PriorityPtr)) {
+    cmp = [&] (const CallBase *L, const CallBase *R) {
+      return PriorityPtr->compare(L, R);
+    };
+  }
+
   size_t size() override { return Heap.size(); }
 
   void push(const T &Elt) override {
     CallBase *CB = Elt.first;
     const int InlineHistoryID = Elt.second;
-    const PriorityT Goodness = PriorityT::evaluate(CB);
 
-    Heap.push_back({CB, Goodness});
+    Heap.push_back(CB);
+    PriorityPtr->update(CB);
     std::push_heap(Heap.begin(), Heap.end(), cmp);
     InlineHistoryMap[CB] = InlineHistoryID;
   }
@@ -138,7 +160,7 @@ public:
     assert(size() > 0);
     adjust();
 
-    CallBase *CB = Heap.front().first;
+    CallBase *CB = Heap.front();
     T Result = std::make_pair(CB, InlineHistoryMap[CB]);
     InlineHistoryMap.erase(CB);
     std::pop_heap(Heap.begin(), Heap.end(), cmp);
@@ -150,21 +172,23 @@ public:
     assert(size() > 0);
     adjust();
 
-    CallBase *CB = Heap.front().first;
+    CallBase *CB = Heap.front();
     return *InlineHistoryMap.find(CB);
   }
 
   void erase_if(function_ref<bool(T)> Pred) override {
-    auto PredWrapper = [=](HeapT P) -> bool {
-      return Pred(std::make_pair(P.first, 0));
+    auto PredWrapper = [=](CallBase *CB) -> bool {
+      return Pred(std::make_pair(CB, 0));
     };
     llvm::erase_if(Heap, PredWrapper);
     std::make_heap(Heap.begin(), Heap.end(), cmp);
   }
 
 private:
-  SmallVector<HeapT, 16> Heap;
+  SmallVector<CallBase *, 16> Heap;
+  std::function<bool(const CallBase *L, const CallBase *R)> cmp;
   DenseMap<CallBase *, int> InlineHistoryMap;
+  std::unique_ptr<InlinePriority> PriorityPtr;
 };
 } // namespace llvm
 #endif // LLVM_ANALYSIS_INLINEORDER_H
