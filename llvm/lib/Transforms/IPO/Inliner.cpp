@@ -158,10 +158,6 @@ static cl::opt<CallSiteFormat::Format> CGSCCInlineReplayFormat(
                    "<Line Number>:<Column Number>.<Discriminator> (default)")),
     cl::desc("How cgscc inline replay file is formatted"), cl::Hidden);
 
-static cl::opt<bool> InlineEnablePriorityOrder(
-    "inline-enable-priority-order", cl::Hidden, cl::init(false),
-    cl::desc("Enable the priority inline order for the inliner"));
-
 LegacyInlinerBase::LegacyInlinerBase(char &ID) : CallGraphSCCPass(ID) {}
 
 LegacyInlinerBase::LegacyInlinerBase(char &ID, bool InsertLifetime)
@@ -781,11 +777,8 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
   // this model, but it is uniformly spread across all the functions in the SCC
   // and eventually they all become too large to inline, rather than
   // incrementally maknig a single function grow in a super linear fashion.
-  std::unique_ptr<InlineOrder<std::pair<CallBase *, int>>> Calls;
-  if (InlineEnablePriorityOrder)
-    Calls = std::make_unique<PriorityInlineOrder<InlineSizePriority>>();
-  else
-    Calls = std::make_unique<DefaultInlineOrder<std::pair<CallBase *, int>>>();
+  std::unique_ptr<InlineOrder<std::pair<CallBase *, int>>> Calls =
+      std::make_unique<DefaultInlineOrder<std::pair<CallBase *, int>>>();
   assert(Calls != nullptr && "Expected an initialized InlineOrder");
 
   // Populate the initial list of calls in this SCC.
