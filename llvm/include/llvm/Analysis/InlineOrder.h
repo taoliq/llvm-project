@@ -72,9 +72,9 @@ private:
 
 class InlinePriority {
 public:
-  virtual bool compare(const CallBase *L, const CallBase *R) = 0;  
+  virtual bool compare(const CallBase *L, const CallBase *R) const = 0;  
   virtual void update(const CallBase *CB) = 0;
-  virtual bool hasDecreasedPriority(const CallBase *CB) = 0;
+  virtual bool updateAndCheckDecreased(const CallBase *CB) = 0;
 };
 
 class SizePriority : public InlinePriority {
@@ -92,7 +92,7 @@ class SizePriority : public InlinePriority {
   }
 
   // Return true if L has higher priority than R.
-  bool compare(const CallBase *L, const CallBase *R) override {
+  bool compare(const CallBase *L, const CallBase *R) const override {
     const auto I1 = Priorities.find(L);
     const auto I2 = Priorities.find(R);
     assert(I1 != Priorities.end() && I2 != Priorities.end());
@@ -106,9 +106,11 @@ public:
     Priorities[CB] = evaluate(CB);
   };
 
-  bool hasDecreasedPriority(const CallBase *CB) override {
-      const auto CurrentPriority = evaluate(CB);
-      return isMoreDesirable(Priorities[CB], CurrentPriority);
+  bool updateAndCheckDecreased(const CallBase *CB) override {
+    const auto OldPriority = Priorities[CB];
+    update(CB);
+    const auto NewPriority = Priorities[CB];
+    return isMoreDesirable(OldPriority, NewPriority);
   }
 };
 
@@ -116,6 +118,14 @@ class PriorityInlineOrder : public InlineOrder<std::pair<CallBase *, int>> {
   using T = std::pair<CallBase *, int>;
   using reference = T &;
   using const_reference = const T &;
+
+  struct PriorityComparator {
+    PriorityComparator(const InlinePriority *IP) : IP(IP) {}
+    bool operator()(const CallBase *L, const CallBase *R) const {
+      return IP->compare(L, R);
+    }
+    const InlinePriority *IP;
+  };
 
   // A call site could become less desirable for inlining because of the size
   // growth from prior inlining into the callee. This method is used to lazily
@@ -125,23 +135,14 @@ class PriorityInlineOrder : public InlineOrder<std::pair<CallBase *, int>> {
   // pushed right back into the heap. For simplicity, those cases where
   // the desirability of a call site increases are ignored here.
   void adjust() {
-    bool Changed = false;
-    do {
-      const CallBase *CB = Heap.front();
-      Changed = PriorityPtr->hasDecreasedPriority(CB);
-      if (Changed) {
-        std::pop_heap(Heap.begin(), Heap.end(), cmp);
-        PriorityPtr->update(CB);
-        std::push_heap(Heap.begin(), Heap.end(), cmp);
-      }
-    } while (Changed);
+    while (PriorityPtr->updateAndCheckDecreased(Heap.front())) {
+      std::pop_heap(Heap.begin(), Heap.end(), PriorityComparator(PriorityPtr.get()));
+      std::push_heap(Heap.begin(), Heap.end(), PriorityComparator(PriorityPtr.get()));
+    }
   }
 
 public:
   PriorityInlineOrder(std::unique_ptr<InlinePriority> PriorityPtr) : PriorityPtr(std::move(PriorityPtr)) {
-    cmp = [&] (const CallBase *L, const CallBase *R) {
-      return PriorityPtr->compare(L, R);
-    };
   }
 
   size_t size() override { return Heap.size(); }
@@ -152,7 +153,7 @@ public:
 
     Heap.push_back(CB);
     PriorityPtr->update(CB);
-    std::push_heap(Heap.begin(), Heap.end(), cmp);
+    std::push_heap(Heap.begin(), Heap.end(), PriorityComparator(PriorityPtr.get()));
     InlineHistoryMap[CB] = InlineHistoryID;
   }
 
@@ -163,7 +164,7 @@ public:
     CallBase *CB = Heap.front();
     T Result = std::make_pair(CB, InlineHistoryMap[CB]);
     InlineHistoryMap.erase(CB);
-    std::pop_heap(Heap.begin(), Heap.end(), cmp);
+    std::pop_heap(Heap.begin(), Heap.end(), PriorityComparator(PriorityPtr.get()));
     Heap.pop_back();
     return Result;
   }
@@ -181,12 +182,11 @@ public:
       return Pred(std::make_pair(CB, 0));
     };
     llvm::erase_if(Heap, PredWrapper);
-    std::make_heap(Heap.begin(), Heap.end(), cmp);
+    std::make_heap(Heap.begin(), Heap.end(), PriorityComparator(PriorityPtr.get()));
   }
 
 private:
   SmallVector<CallBase *, 16> Heap;
-  std::function<bool(const CallBase *L, const CallBase *R)> cmp;
   DenseMap<CallBase *, int> InlineHistoryMap;
   std::unique_ptr<InlinePriority> PriorityPtr;
 };
